@@ -1,0 +1,66 @@
+# Qwen3.8-Flash-Next on a single RTX PRO 6000 96GB — Playbook
+
+Everything learned running **Qwen3.8-Flash-Next** (hybrid GDN + QSA + PLE + MTP) on one
+RTX PRO 6000 Blackwell 96GB (SM120) with **SGLang + SSD Stream PLE**, distilled into a
+reproducible kit: Docker image build, launch profiles, quality probes, and a field log
+of every dead end we hit.
+
+## What works today
+
+| Result | Value | How |
+|---|---|---|
+| Context | **262,144 tokens (native max)** at fp8 KV | `--ple-offload-embedding` + SSD Stream PLE + #32468 backport, `FRACTION=0.99` |
+| Throughout | 60-200 tok/s single stream, `cuda graph: True`, accept 0.3-0.9 | fp8 draft (`--speculative-draft-model-quantization fp8`, saves 3.3GB, no accept penalty) |
+| Models served | vendor RadixArk NVFP4 (512E) and lovedheart AIMER-pruned 448E (saves 14GB VRAM) | same image, one switch in the launcher |
+| VRAM | ~77GB resident (512E, PLE streamed to 0 VRAM), 15GB headroom for KV | SSD Stream plugin, io_uring O_DIRECT reads |
+
+## Repo map
+
+```
+docker-target/            build of image sglang-flash-27b:latest (see docs/01-BUILD.md)
+  Dockerfile                layered recipe: pinned sglang 3df8e1e7 + flashinfer 0.6.17 stack + plugins + patches
+  patches/*.py[.in]     source patches applied at build (FP8_PB_WO routing, MTP #32468, mamba radix fixes)
+config/
+  run_sglang_flash_next.bat  vendor (RadixArk) profile — dual-profile MODEL=vendor|loved
+  run_sglang_loved.bat       lovedheart-only launcher (container sglang-loved, port 18082)
+  run_sglang_27B_dflash2.bat   Qwen3.8-27B + DFlash2 profile (coexist image)
+scripts/
+  kv_quality_ab.py       fp8 KV vs bf16 KV needle tests (easy + hard profiles)
+  bench_flash.py         prefill throughput sanity probe
+  lovedheart/          one-off deploy kit: download, PLE byte-ident probe, mtp/ synthesis, deploy.sh
+docs/
+  01-BUILD.md    how to build the image
+  02-RUN.md    launch profiles and every flag that matters
+  03-FINDINGS.md    performance and VRAM laws on this card
+  04-DEBUG-LOG.md    what broke, why, how to avoid (JIT cliff, OOMs, dead ends)
+  05-DATA.md    all measured numbers + env facts + open experiments
+  06-PATCHES.md      what each source patch does
+  07-PRUNED-vs-FULL.md   448E pruned vs 512E vendor: diffs, evals, trade-offs
+  08-RESOURCES.md    every external link: commits, PRs, models, papers, validation kits
+```
+
+## Reproduce in 5 steps
+
+1. Build the image (`docker build -t sglang-flash-27b:latest docker-target`) — see `docs/01-BUILD.md`.
+2. Place models in `~/.cache/huggingface/hub` (HF_ENDPOINT=https://hf-mirror.com if GitHub/HF is slow).
+3. For lovedheart: run the one-off deploy kit (`docs/02-RUN.md` §B) — index surgery, symlink PLE
+   (byte-ident re-shard, zero copy), `mtp/` synthesis. 10 s.
+4. Launch: `run_sglang_flash_next.bat` (vendor) or `run_sglang_loved.bat` (pruned).
+5. Accept test:
+```bash
+curl.exe http://127.0.0.1:18081/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"model":"Qwen3.8-Flash-Next","messages":[{"role":"user","content":"What is the capital of France? Answer in one word."}],"temperature":0,"max_tokens":512}'
+# -> "Paris" in content => FP8_PB_WO dispatch is live. Garbled text => patch not applied.
+```
+
+## The five non-negotiables
+
+1. `--security-opt seccomp=unconfined` — SSD Stream's io_uring is blocked by the default seccomp.
+2. **Never set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`** — hard driver crash on WSL2 (`docs/04-DEBUG-LOG.md` §3). Also never `docker rm` a running service container you did not start.
+3. KV pool cannot exceed `max_position_embeddings=262,144`; `FRACTION=0.99` + the #32468 backport unlocks exactly that.
+4. FP8_PB_WO layers need the routing patch (stock builds emit **silent garbled output**, no error).
+5. KV dtype: fp8_e4m3 passes needle tests; bf16 KV only worth it if the hard profile (decoys + multi-hop) says otherwise.
+
+Plus one housekeeping rule: keep the two cache mounts in every launcher — `jit_cache` (flashinfer
+autotune) and `triton_cache` (`/root/.triton`) — so long-context never pays JIT again per restart
+(`docs/04-DEBUG-LOG.md` §1.5).
