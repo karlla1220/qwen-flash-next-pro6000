@@ -21,3 +21,36 @@ COPY patches-official/qwen_sparse_attn_backend.py \
 
 RUN python3 -c "import ast; ast.parse(open('/sgl-workspace/sglang/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py').read()); print('qwen_sparse_attn_backend.py syntax OK')" \
  && python3 -c "import sglang.srt.layers.attention.qwen_sparse_attn_backend; print('import OK')"
+
+# Second overlay on the same base image: fixes a transient full-size GPU
+# allocation in Qwen4ExpNGramEmbedding.__init__ (qwen4_exp.py) that occurs
+# whenever --ple-offload-embedding is combined with a PLE table stored at
+# BF16 (i.e. --json-model-override-args '{"text_config":
+# {"ple_embedding_dtype": null}}', see docs/09-PRIMITIVE-RAM-OFFLOAD.md).
+# VocabParallelEmbedding's underlying UnquantizedEmbeddingMethod.create_weights
+# (layers/quantization/unquant.py) allocates its initial tensor with no
+# device= kwarg, so it lands on CUDA via the ambient `with torch.device("cuda"):`
+# context that DefaultModelLoader.initialize_model_for_startup wraps model
+# construction in (model_loader/loader.py) -- a ~48GB (fp8) or ~95GB (bf16)
+# transient spike, freed moments later by Qwen4ExpPinnedHostEmbedding.__init__
+# copying it to pinned host RAM, but PyTorch's CUDA caching allocator does not
+# reliably return that freed VRAM to the driver, and on a near-full card this
+# spike alone can OOM the mamba/linear-attention state-cache sizing that runs
+# right after model construction ("Not enough GPU memory for hybrid
+# (mamba/linear-attention) state cache"). Reproduced live: fp8 (~48GB spike)
+# boots fine at --mem-fraction-static 0.96; bf16 (~95GB spike) OOMs with that
+# exact error.
+#
+# Fix: construct just the VocabParallelEmbedding under `with torch.device("cpu"):`
+# whenever config.ple_offload_embedding is set -- there's no reason for a
+# table whose final home is pinned host RAM to ever touch the GPU. Not an
+# upstream commit backport (no matching fix found upstream as of 593134d17);
+# this is a local root-caused fix using an idiom already present elsewhere in
+# this same sglang codebase for defeating an ambient CUDA default-device
+# context (utils/common.py's device_context() helper; models/transformers.py
+# ~L257-259; lora/backend/chunked_backend.py ~L485,535).
+COPY patches-official/qwen4_exp.py \
+  /sgl-workspace/sglang/python/sglang/srt/models/qwen4_exp.py
+
+RUN python3 -c "import ast; ast.parse(open('/sgl-workspace/sglang/python/sglang/srt/models/qwen4_exp.py').read()); print('qwen4_exp.py syntax OK')" \
+ && python3 -c "import sglang.srt.models.qwen4_exp; print('import OK')"

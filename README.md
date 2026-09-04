@@ -21,8 +21,9 @@ docker-target/            build of image sglang-flash-27b:latest (see docs/01-BU
   Dockerfile                layered recipe: pinned sglang 3df8e1e7 + flashinfer 0.6.17 stack + plugins + patches
   patches/*.py[.in]     source patches applied at build (FP8_PB_WO routing, MTP #32468, mamba radix fixes)
   Dockerfile.qsa-fp8-fix    one-file overlay on lmsysorg/sglang:qwen38flashnext: backports the QSA
-                            fp8-KV-gather dtype fix (see docs/09-PRIMITIVE-RAM-OFFLOAD.md)
-  patches-official/qwen_sparse_attn_backend.py   the patched file that overlay copies in
+                            fp8-KV-gather dtype fix + fixes a transient GPU OOM in PLE-offload's
+                            BF16-table construction (see docs/09-PRIMITIVE-RAM-OFFLOAD.md)
+  patches-official/qwen_sparse_attn_backend.py, qwen4_exp.py   the two patched files that overlay copies in
 config/
   run_sglang_flash_next.bat  vendor (RadixArk) profile — dual-profile MODEL=vendor|loved
   run_sglang_loved.bat       lovedheart-only launcher (container sglang-loved, port 18082)
@@ -51,13 +52,15 @@ The rest of this README describes the SSD-Stream setup. There's a second, simple
 profile for when NVMe streaming isn't wanted: `primitive-ai/Qwen3.8-Flash-Next-NVFP4`
 served with sglang's native `--ple-offload-embedding` (the PLE table pins to host
 RAM, ~95GiB resident by default — BF16, matching the checkpoint's shipped shards;
-`PLE_DTYPE_OVERRIDE=0` trades accuracy for an uncalibrated fp8 downcast at ~48GiB)
-— no SSD Stream plugin, on the stock `lmsysorg/sglang:qwen38flashnext`
-image plus one small overlay (`docker-target/Dockerfile.qsa-fp8-fix`) needed only to
-make `--kv-cache-dtype fp8_e4m3` survive QSA's cached-prefix path. See
-`docs/09-PRIMITIVE-RAM-OFFLOAD.md` for what does and doesn't need patching and what
-was validated; `config/run_primitive_ram.sh` + `scripts/primitive/mtp_synth.py` to
-reproduce.
+`PLE_DTYPE_OVERRIDE=0` keeps a smaller, uncalibrated fp8 downcast at ~48GiB instead
+if RAM budget is tighter than ~100GB) — no SSD Stream plugin, on the stock
+`lmsysorg/sglang:qwen38flashnext` image plus one small overlay
+(`docker-target/Dockerfile.qsa-fp8-fix`) that backports two fixes: making
+`--kv-cache-dtype fp8_e4m3` survive QSA's cached-prefix path, and preventing a
+transient GPU OOM when the BF16 PLE table is combined with
+`--ple-offload-embedding`. See `docs/09-PRIMITIVE-RAM-OFFLOAD.md` for what does
+and doesn't need patching and what was validated; `config/run_primitive_ram.sh` +
+`scripts/primitive/mtp_synth.py` to reproduce.
 
 ## Reproduce in 5 steps
 

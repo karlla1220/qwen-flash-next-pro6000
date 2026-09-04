@@ -42,11 +42,17 @@ DRAFT8="${DRAFT8:-on}"
 # "float8_e4m3fn", which silently downcasts the PLE/n-gram table to an
 # uncalibrated fp8 (weight_scale hardcoded to 1.0) even though this checkpoint
 # ships real BF16 PLE shards and the model card documents ~100GB BF16 host RAM
-# residency for exactly this checkpoint (contrasted against separate "FP8-table
-# checkpoints"). That's the same class of accuracy loss this whole RAM-offload
-# profile was set up to avoid (see docs/09-PRIMITIVE-RAM-OFFLOAD.md). Override it
-# without touching the downloaded checkpoint: PLE_DTYPE_OVERRIDE=0 to keep fp8
-# (smaller RAM footprint, ~48GB) if you've decided the accuracy loss is acceptable.
+# residency for exactly this checkpoint. PLE_DTYPE_OVERRIDE=1 (default) undoes
+# that via --json-model-override-args, restoring the BF16 table the checkpoint
+# author intended (~95GB resident instead of ~48GB). Historical note:
+# combining this override with --ple-offload-embedding used to OOM at boot
+# ("Not enough GPU memory for hybrid (mamba/linear-attention) state cache")
+# because of a transient ~95GB GPU allocation during model construction --
+# fixed in docker-target/patches-official/qwen4_exp.py (see
+# docs/09-PRIMITIVE-RAM-OFFLOAD.md, "PLE offload + BF16 table" section); IMAGE
+# below already includes that fix. Set PLE_DTYPE_OVERRIDE=0 to keep the
+# smaller uncalibrated fp8 downcast instead, if RAM budget is tighter than
+# ~100GB.
 PLE_DTYPE_OVERRIDE="${PLE_DTYPE_OVERRIDE:-1}"
 OVERRIDE_FLAGS=()
 if [ "$PLE_DTYPE_OVERRIDE" = "1" ]; then

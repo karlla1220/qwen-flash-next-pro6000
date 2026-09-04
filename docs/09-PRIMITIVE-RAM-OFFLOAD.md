@@ -117,6 +117,54 @@ quality difference; the fix here is "match the checkpoint author's own stated
 design and avoid an unnecessary uncalibrated quantization," not a measured
 quality delta.
 
+## PLE offload + BF16 table: transient GPU OOM during hybrid-cache sizing
+
+Turning on the BF16-table fix above (`PLE_DTYPE_OVERRIDE=1`) together with
+`--ple-offload-embedding` used to OOM at boot with `RuntimeError: Not enough
+GPU memory for hybrid (mamba/linear-attention) state cache` on this box (512E
+model already resident at ~93.6GiB of a 97.9GiB card). Root cause, confirmed
+by reading `qwen4_exp.py`/`unquant.py`/`model_loader/loader.py` live inside
+the running container: `Qwen4ExpNGramEmbedding.__init__`'s
+`VocabParallelEmbedding(...)` construction bottoms out in
+`UnquantizedEmbeddingMethod.create_weights` (`layers/quantization/unquant.py`),
+which calls `torch.empty(...)` with no `device=` kwarg. Model construction
+happens inside `DefaultModelLoader.initialize_model_for_startup`'s
+`with target_device:` (`target_device = torch.device("cuda")`), so this
+tensor lands on GPU by ambient default-device context — the FULL PLE table,
+once per `ple_layer_ids` entry, each with its own independent table
+(`Qwen4ExpLayerExtensionMixin._init_qwen4_exp_layer_extensions`), sized
+~48GiB (fp8) or ~95GiB (bf16) depending on `ple_embedding_dtype`. It's freed
+a few lines later once `Qwen4ExpPinnedHostEmbedding.__init__` copies it to
+pinned host RAM and `del embedding.weight`s the GPU original — but the
+transient spike alone, plus PyTorch's CUDA caching allocator not reliably
+returning freed blocks to the driver, is enough to starve the mamba-cache
+sizing that runs right after model construction on a near-full card.
+Confirmed empirically on this box, identical flags apart from
+`PLE_DTYPE_OVERRIDE`: fp8 (~48GiB spike) boots fine at `FRACTION=0.96`; bf16
+(~95GiB spike) pushes VRAM to ~99% and OOMs with the exact error above.
+
+Fix: in `Qwen4ExpNGramEmbedding.__init__`, construct the
+`VocabParallelEmbedding` under `with torch.device("cpu"):` whenever
+`config.ple_offload_embedding` is set. There's no reason for a table whose
+final home is pinned host RAM (`Qwen4ExpPinnedHostEmbedding`) to ever touch
+the GPU in the first place; `Qwen4ExpPinnedHostEmbedding.__init__`'s own CPU
+pinned-tensor allocation already explicitly passes `device="cpu"`, so it's
+unaffected — it now does a CPU→pinned-CPU copy instead of GPU→pinned-CPU.
+Not an upstream commit backport (no matching fix found upstream as of
+`593134d17`); uses an idiom already established elsewhere in this sglang
+codebase for defeating an ambient CUDA default-device context
+(`utils/common.py`'s `device_context()`; `models/transformers.py:257-259`;
+`lora/backend/chunked_backend.py:485,535`).
+
+Applied as a second overlay in the SAME `docker-target/Dockerfile.qsa-fp8-fix`
+(one more `COPY` of `docker-target/patches-official/qwen4_exp.py`, the stock
+file extracted from the running container with the `torch.device("cpu")`
+wrap added) — kept in the same image/tag as the QSA fp8-KV fix rather than a
+separate Dockerfile, since both are one-file overlays on the same base image
+for the same profile and there's no scenario here needing one without the
+other. Rebuilt and re-tagged `sglang-flash-ram:qsa-fp8-fix` (same tag, new
+layer).
+
 ## Model layout: primitive-ai/Qwen3.8-Flash-Next-NVFP4
 
 - Full 512-expert checkpoint (not pruned like lovedheart), NVFP4 experts + BF16
@@ -171,3 +219,16 @@ PORT=8000 bash config/run_primitive_ram.sh
 - Full `CTX=262144` not yet pushed to the limit in this pass — start from
   `FRACTION=0.94 DRAFT8=on` and back off `--max-running-requests`/context if the
   mamba-cache-sizing error above reappears.
+- Post-fix (`qwen4_exp.py` PLE-offload GPU-OOM fix, rebuilt into the same
+  `sglang-flash-ram:qsa-fp8-fix` tag): `CTX=262144 SPEC=on DRAFT8=on
+  PLE_DTYPE_OVERRIDE=1 FRACTION=0.94` — the exact config that previously OOM'd
+  with `Not enough GPU memory for hybrid (mamba/linear-attention) state cache`
+  (BF16 table's transient GPU spike) — now boots cleanly at full context.
+  `Load weight end`: `avail mem=12.56 GB, mem usage=81.05 GB` (vs. the
+  pre-fix run's `avail mem=0.00 GB, mem usage=93.60 GB` for the *fp8* table at
+  the same fraction — the fix leaves substantially more headroom, not less,
+  since the table no longer touches the GPU at all). Steady-state after boot:
+  `nvidia-smi` ~92GiB/97.9GiB VRAM (KV/mamba cache + cuda graphs at full
+  262144 context, not a PLE spike), scheduler process RSS ~137.9GiB host RAM
+  (the ~95GiB BF16 table now resident there instead of transiting the GPU).
+  Accept test → `Paris`, reasoning intact.
