@@ -54,3 +54,29 @@ COPY patches-official/qwen4_exp.py \
 
 RUN python3 -c "import ast; ast.parse(open('/sgl-workspace/sglang/python/sglang/srt/models/qwen4_exp.py').read()); print('qwen4_exp.py syntax OK')" \
  && python3 -c "import sglang.srt.models.qwen4_exp; print('import OK')"
+
+# Third overlay: backport of sgl-project/sglang#32468 (still OPEN upstream as of
+# 593134d17) -- moves the draft's init_token_map()/init_lm_head() out of
+# alloc_memory_pool() and into EagleDraftWorker.__init__, so the draft's own
+# embed/lm_head copies are freed (torch.cuda.empty_cache) BEFORE the scheduler's
+# init_target_memory_pool() profiles free memory to size the KV cache, instead
+# of being freed into an already-fixed budget afterwards.
+#
+# Measured on this box, not estimated: with the stock order the draft-owned
+# copies cost ~1.3 GB at boot (draft loaded with
+# --speculative-draft-model-quantization fp8; vocab 248320 x hidden 2560), so
+# the expected effect is roughly +110K KV tokens (520960 -> ~630K at the
+# default fp8_e4m3 KV) or equivalent FRACTION headroom -- NOT a crash fix:
+# this profile already boots CTX=262144 at FRACTION=0.96 unpatched, with 4.59 GB
+# to spare. Re-verified against this image's stock file: only the 3-line
+# reorder is applied (stock drifted ~170 diff lines vs the old
+# patches/eagle_worker_v2.py: get_spec()/get_parallel() refactor,
+# unwrap_lora_layer, draft_pp_context -- copying the old file would regress
+# all of it). One behavior delta: with --speculative-use-rejection-sampling,
+# the draft/target vocab-mismatch ValueError now fires at worker construction
+# instead of pool allocation (unused by this profile).
+COPY patches-official/eagle_worker_v2.py \
+  /sgl-workspace/sglang/python/sglang/srt/speculative/eagle_worker_v2.py
+
+RUN python3 -c "import ast; ast.parse(open('/sgl-workspace/sglang/python/sglang/srt/speculative/eagle_worker_v2.py').read()); print('eagle_worker_v2.py syntax OK')" \
+ && python3 -c "import inspect; from sglang.srt.speculative import eagle_worker_v2 as e; s=inspect.getsource(e.EagleDraftWorker.__init__); a=inspect.getsource(e.EagleDraftWorker.alloc_memory_pool); assert 'init_lm_head()' in s and 'empty_cache' in s, 'patch missing from __init__'; assert 'init_lm_head()' not in a, 'init_lm_head still in alloc_memory_pool'; print('eagle_worker_v2 #32468 backport OK')"

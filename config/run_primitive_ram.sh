@@ -14,11 +14,15 @@
 # repo only for the SSD Stream plugin's io_uring syscalls, which this profile doesn't use.
 #
 # IMAGE defaults to sglang-flash-ram:qsa-fp8-fix: the official day-1 image
-# (lmsysorg/sglang:qwen38flashnext, commit 593134d17) plus a one-file backport of
-# sgl-project/sglang@d6ff2d881e78d0746e0393e9860ce3de5d84de8b (docker-target/Dockerfile.qsa-fp8-fix).
-# Without it, --kv-cache-dtype fp8_e4m3 crashes ("Unsupported rhs dtype fp8e4nv") the
-# first time QSA's forward_extend() hits a cached prefix under fp8 KV (2nd+ chunked-
-# prefill chunk, or any multi-turn/radix-cache-hit request) - see docs/09-PRIMITIVE-RAM-OFFLOAD.md.
+# (lmsysorg/sglang:qwen38flashnext, commit 593134d17) plus file overlays from
+# docker-target/Dockerfile.qsa-fp8-fix. Currently BUILT into the tag: (1) backport of
+# sgl-project/sglang@d6ff2d881e78d0746e0393e9860ce3de5d84de8b - without it
+# --kv-cache-dtype fp8_e4m3 crashes ("Unsupported rhs dtype fp8e4nv") the first time
+# QSA's forward_extend() hits a cached prefix under fp8 KV (2nd+ chunked-prefill chunk,
+# or any multi-turn/radix-cache-hit request); (2) qwen4_exp.py PLE-offload GPU-OOM fix.
+# STAGED in the Dockerfile but NOT yet built (as of 2026-09-05): (3) eagle_worker_v2.py
+# re-port of #32468 - rebuild the tag + restart to pick it up (docs/09). See
+# docs/09-PRIMITIVE-RAM-OFFLOAD.md.
 # Build: cd docker-target && docker build -t sglang-flash-ram:qsa-fp8-fix -f Dockerfile.qsa-fp8-fix .
 set -euo pipefail
 

@@ -29,7 +29,15 @@ Runtime layout inside the image (authoritative):
     flashinfer/ …
 /sgl-workspace/sglang   ← leftover base-image git checkout (main branch)
 ```
-> **Important:** always take `dist-packages` as the patch baseline. `/sgl-workspace` is main, and patching against it silently produces a file with the wrong tree (e.g. SM120 GEMV, no NvFp4EmbeddingMethod). We learned this the hard way (see `04-DEBUG-LOG.md` #3).
+> **Important (this image only):** always take `dist-packages` as the patch baseline. `/sgl-workspace` is main, and patching against it silently produces a file with the wrong tree (e.g. SM120 GEMV, no NvFp4EmbeddingMethod). We learned this the hard way (see `04-DEBUG-LOG.md` #3).
+> This is a property of *this* base + layer 1's `pip install sglang @ <pin tarball>`, which is what makes
+> `dist-packages` win over the checkout. **It does not generalize:** the other image built here,
+> `Dockerfile.qsa-fp8-fix` on `lmsysorg/sglang:qwen38flashnext`, has no pip-install layer and the
+> `/sgl-workspace/sglang` checkout there *is* the live import path (verified: `import
+> sglang.srt.models.qwen4_exp` → `/sgl-workspace/sglang/python/...`), so its overlays must COPY into
+> `/sgl-workspace/sglang/python/sglang/...` and must not be "corrected" to dist-packages. When in
+> doubt, resolve the path from inside the base image rather than guessing:
+> `docker run --rm --entrypoint python3 <base> -c "import sglang.srt.models.qwen4_exp as m; print(m.__file__)"`.
 
 Verify after build (no GPU needed):
 

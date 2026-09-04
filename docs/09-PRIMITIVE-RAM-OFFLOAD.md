@@ -25,8 +25,9 @@ commit `593134d17a6eb0d0fc5f71a970cd2e9dc8e26e8b`, 2026-09-03):
   out of `alloc_memory_pool()` so the draft's own embed/head copies are freed
   *before* KV-pool sizing profiles free memory) — **still not merged upstream**
   as of this commit. Effect if skipped: the KV budget is sized a bit more
-  conservatively (a few GB), not a crash. Not worth patching for this profile;
-  revisit only if you need every last token of context.
+  conservatively (measured later at ~1.3 GB on this profile — see the third
+  overlay section below), not a crash. Initially skipped; ported as a third
+  overlay on 2026-09-05 once the exact cost was measured (staged, not yet built).
 
 So this profile runs the stock image unmodified. The other 7 local patches
 (`auto_round.py`, `gptq.py`, `compressed_tensors.py`, `qwen3_5.py`,
@@ -164,6 +165,48 @@ separate Dockerfile, since both are one-file overlays on the same base image
 for the same profile and there's no scenario here needing one without the
 other. Rebuilt and re-tagged `sglang-flash-ram:qsa-fp8-fix` (same tag, new
 layer).
+
+## Third overlay: #32468 re-port (`eagle_worker_v2.py`) — staged, NOT yet built
+
+Status as of 2026-09-05: **the overlay file and Dockerfile block exist in the
+repo but the image has NOT been rebuilt and the running container is NOT
+restarted.** All numbers below are measurements of the *unpatched* boot plus
+arithmetic; the patched boot is unverified until someone builds and re-runs.
+
+Re-checked against the actual PR (2026-09-05): [sgl-project/sglang#32468](https://github.com/sgl-project/sglang/pull/32468)
+is still **OPEN**, 1 commit (`a15c74d`), +13/−2, 1 file, unreviewed (author
+can't get the `run-ci` label so the gate skips real tests). The PR diff is
+exactly the 3-line change we ported: `init_token_map()` + `init_lm_head()` +
+`torch.cuda.empty_cache()` move from the end of `alloc_memory_pool()` to the
+end of `EagleDraftWorker.__init__` (our staged file = PR semantics, ported
+onto this image's stock file — the old `patches/eagle_worker_v2.py` tree would
+have regressed 5 drifted stock hunks, ~170 diff lines: `get_spec()` /
+`get_parallel()` refactor, `unwrap_lora_layer`, `draft_pp_context`).
+
+What it costs in VRAM on THIS profile, measured from the running container's
+boot log rather than estimated: draft weight load used 3.86 GB against a
+quantized MTP checkpoint of 2.61 GB on disk (31 tensors, 5.21 GB BF16 / 2.61
+GB in-file fp8) → the draft's shareable duplicates are resident at **~1.3 GB**
+at profile time (vocab 248,320 x hidden 2,560 = 1.27 GB/tensor BF16; the
+upstream PR's "2.54 GB each" math is hidden=5120 — the SSD-stream profile's
+model, not this one). Expected effect: KV `#tokens` ~520,960 → ~630K
+(+~1.3 GB / 11.4 B-per-token fp8 KV), or the same KV at lower FRACTION.
+Expected NOT to happen: anything dramatic — this profile already boots
+CTX=262144 SPEC=on at FRACTION=0.96 unpatched with 4.59 GB spare, so #32468
+here is headroom, not an enabler (it IS an enabler on the SSD-stream image —
+that's the row in `06-PATCHES.md`, different card math). PR author reports
+greedy output byte-identical before/after (pure order-of-assignment move);
+one behavior delta: with `--speculative-use-rejection-sampling` the
+draft/target vocab-mismatch `ValueError` now fires at worker construction
+instead of pool alloc (unused by this profile).
+
+Dockerfile gate for the third overlay is stronger than syntax+import: the
+build asserts `init_lm_head()` present in `EagleDraftWorker.__init__` and
+absent from `alloc_memory_pool()`, so a future pin bump that silently ships
+the PR upstream (or drops our overlay) fails the build loudly instead of
+quietly. When that happens, delete this overlay — do not "fix" the assert.
+Also on any pin bump: re-check #32468's merge status first (see 08); if
+merged, the assert firing is expected, not a bug.
 
 ## Model layout: primitive-ai/Qwen3.8-Flash-Next-NVFP4
 
