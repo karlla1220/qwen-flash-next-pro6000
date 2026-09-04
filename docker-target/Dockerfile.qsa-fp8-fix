@@ -1,0 +1,23 @@
+# One-file overlay on the official day-1 image: backports
+# sgl-project/sglang@d6ff2d881e78d0746e0393e9860ce3de5d84de8b
+# ("Cast gathered fp8 KV to compute dtype before Triton sparse GQA decode")
+# onto lmsysorg/sglang:qwen38flashnext (commit 593134d17, 2026-09-03), which does not
+# have it: the QSA forward_extend() prefix-hit branch gathers K/V straight from the
+# fp8_e4m3 KV pool and calls sparse_gqa_fwd_interface_triton_ck() without casting,
+# so tl.dot(bf16 q, fp8 k) fails to compile ("Unsupported rhs dtype fp8e4nv") on any
+# request that hits cached prefix under fp8 KV (2nd+ chunked-prefill chunk, or a
+# radix-cache-hit multi-turn request). Fresh requests with no prefix take a
+# different branch with freshly-computed bf16 k/v and never hit this.
+#
+# The companion fix in the same source lineage, sgl-project/sglang@fa862ff2 (route
+# QSA sparse decode through trtllm-gen on SM120 too), is NOT re-applied here: this
+# image already has the equivalent gate (`is_sm100_supported() or is_sm120()` in
+# qwen_sparse_attn_backend.py's _resolve_trtllm_sparse_decode), just under a
+# differently-named helper — it was independently fixed upstream.
+FROM lmsysorg/sglang:qwen38flashnext
+
+COPY patches-official/qwen_sparse_attn_backend.py \
+  /sgl-workspace/sglang/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
+
+RUN python3 -c "import ast; ast.parse(open('/sgl-workspace/sglang/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py').read()); print('qwen_sparse_attn_backend.py syntax OK')" \
+ && python3 -c "import sglang.srt.layers.attention.qwen_sparse_attn_backend; print('import OK')"

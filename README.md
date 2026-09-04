@@ -20,14 +20,19 @@ of every dead end we hit.
 docker-target/            build of image sglang-flash-27b:latest (see docs/01-BUILD.md)
   Dockerfile                layered recipe: pinned sglang 3df8e1e7 + flashinfer 0.6.17 stack + plugins + patches
   patches/*.py[.in]     source patches applied at build (FP8_PB_WO routing, MTP #32468, mamba radix fixes)
+  Dockerfile.qsa-fp8-fix    one-file overlay on lmsysorg/sglang:qwen38flashnext: backports the QSA
+                            fp8-KV-gather dtype fix (see docs/09-PRIMITIVE-RAM-OFFLOAD.md)
+  patches-official/qwen_sparse_attn_backend.py   the patched file that overlay copies in
 config/
   run_sglang_flash_next.bat  vendor (RadixArk) profile — dual-profile MODEL=vendor|loved
   run_sglang_loved.bat       lovedheart-only launcher (container sglang-loved, port 18082)
   run_sglang_27B_dflash2.bat   Qwen3.8-27B + DFlash2 profile (coexist image)
+  run_primitive_ram.sh   primitive-ai checkpoint, PLE via native --ple-offload-embedding (host RAM, no SSD stream), stock official image
 scripts/
   kv_quality_ab.py       fp8 KV vs bf16 KV needle tests (easy + hard profiles)
   bench_flash.py         prefill throughput sanity probe
   lovedheart/          one-off deploy kit: download, PLE byte-ident probe, mtp/ synthesis, deploy.sh
+  primitive/mtp_synth.py  mtp/ synthesis for primitive-ai/Qwen3.8-Flash-Next-NVFP4 (RAM-offload profile)
 docs/
   01-BUILD.md    how to build the image
   02-RUN.md    launch profiles and every flag that matters
@@ -37,7 +42,22 @@ docs/
   06-PATCHES.md      what each source patch does
   07-PRUNED-vs-FULL.md   448E pruned vs 512E vendor: diffs, evals, trade-offs
   08-RESOURCES.md    every external link: commits, PRs, models, papers, validation kits
+  09-PRIMITIVE-RAM-OFFLOAD.md   RAM-offloaded PLE profile (no SSD Stream): why no custom image is needed, validated numbers
 ```
+
+## RAM-offloaded PLE profile (no SSD Stream, WSL2 Ubuntu)
+
+The rest of this README describes the SSD-Stream setup. There's a second, simpler
+profile for when NVMe streaming isn't wanted: `primitive-ai/Qwen3.8-Flash-Next-NVFP4`
+served with sglang's native `--ple-offload-embedding` (the PLE table pins to host
+RAM, ~95GiB resident by default — BF16, matching the checkpoint's shipped shards;
+`PLE_DTYPE_OVERRIDE=0` trades accuracy for an uncalibrated fp8 downcast at ~48GiB)
+— no SSD Stream plugin, on the stock `lmsysorg/sglang:qwen38flashnext`
+image plus one small overlay (`docker-target/Dockerfile.qsa-fp8-fix`) needed only to
+make `--kv-cache-dtype fp8_e4m3` survive QSA's cached-prefix path. See
+`docs/09-PRIMITIVE-RAM-OFFLOAD.md` for what does and doesn't need patching and what
+was validated; `config/run_primitive_ram.sh` + `scripts/primitive/mtp_synth.py` to
+reproduce.
 
 ## Reproduce in 5 steps
 
